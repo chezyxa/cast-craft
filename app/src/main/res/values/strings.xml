@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Cast Craft</string>
+    <string name="status_starting">Starting AirPlay receiver…</string>
+    <string name="status_ready">Ready for AirPlay.\nOn your iPhone open Control Center → Screen Mirroring → choose “%1$s”.</string>
+    <string name="status_ip">TV address: %1$s</string>
+    <string name="status_connecting">Connecting to %1$s…</string>
+    <string name="status_failed">Could not start the AirPlay receiver. Check the network connection and reopen the app.</string>
+</resources>
