@@ -8,8 +8,6 @@ on:
 
 permissions:
   contents: write
-  pages: write
-  id-token: write
 
 jobs:
   build:
@@ -75,13 +73,14 @@ jobs:
           <meta http-equiv="refresh" content="0; url=tv.apk">
           <p><a href="tv.apk">Cast Craft APK</a></p>
           HTML
-      - uses: actions/configure-pages@v5
+      # Served by GitHub Pages (Settings -> Pages -> Deploy from branch: gh-pages)
+      - name: Publish site to gh-pages
         if: github.event_name == 'push'
-        with:
-          enablement: true
-      - uses: actions/upload-pages-artifact@v3
-        if: github.event_name == 'push'
-        with:
-          path: site
-      - uses: actions/deploy-pages@v4
-        if: github.event_name == 'push'
+        run: |
+          cd site
+          touch .nojekyll
+          git init -q -b gh-pages
+          git add -A
+          git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com \
+            commit -qm "Cast Craft APK from ${GITHUB_SHA}"
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
