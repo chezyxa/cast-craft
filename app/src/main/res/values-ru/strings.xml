@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Cast Craft</string>
+    <string name="status_starting">Запуск приёмника AirPlay…</string>
+    <string name="status_ready">Готово к AirPlay.\nНа iPhone откройте Пункт управления → Повтор экрана → выберите «%1$s».</string>
+    <string name="status_ip">Адрес телевизора: %1$s</string>
+    <string name="status_connecting">Подключение %1$s…</string>
+    <string name="status_failed">Не удалось запустить приёмник AirPlay. Проверьте подключение к сети и откройте приложение снова.</string>
+</resources>
