@@ -8,6 +8,8 @@ on:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 jobs:
   build:
@@ -61,3 +63,25 @@ jobs:
             gh release create latest --title "Cast Craft (latest build)" \
               --notes "Latest APK built from ${GITHUB_REF_NAME}. Install on Google TV / Android TV."
           gh release upload latest CastCraft.apk --clobber
+
+      # Short link for the TV: https://<owner>.github.io/<repo>/ (and .../tv.apk)
+      - name: Prepare GitHub Pages site
+        if: github.event_name == 'push'
+        run: |
+          mkdir -p site
+          cp CastCraft.apk site/tv.apk
+          cat > site/index.html <<'HTML'
+          <!doctype html><meta charset="utf-8"><title>Cast Craft</title>
+          <meta http-equiv="refresh" content="0; url=tv.apk">
+          <p><a href="tv.apk">Cast Craft APK</a></p>
+          HTML
+      - uses: actions/configure-pages@v5
+        if: github.event_name == 'push'
+        with:
+          enablement: true
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name == 'push'
+        with:
+          path: site
+      - uses: actions/deploy-pages@v4
+        if: github.event_name == 'push'
