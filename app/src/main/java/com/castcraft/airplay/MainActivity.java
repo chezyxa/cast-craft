@@ -27,13 +27,18 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
+import androidx.media3.ui.AspectRatioFrameLayout;
+import androidx.media3.ui.PlayerView;
+
 import java.io.File;
 import java.net.Inet4Address;
 import java.security.SecureRandom;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-public final class MainActivity extends Activity implements AirPlayServer.Listener, VideoDecoder.SizeListener {
+public final class MainActivity extends Activity
+        implements AirPlayServer.Listener, VideoDecoder.SizeListener, HlsPlayer.Listener {
     private static final String TAG = "CastCraft";
     private static final String PREF_MAC = "mac";
 
@@ -41,12 +46,14 @@ public final class MainActivity extends Activity implements AirPlayServer.Listen
 
     private FrameLayout root;
     private SurfaceView surfaceView;
+    private PlayerView playerView;
     private View idleView;
     private TextView titleView;
     private TextView statusView;
 
     private VideoDecoder video;
     private AudioPlayer audio;
+    private HlsPlayer hls;
     private AirPlayServer server;
     private String serverName;
     private int videoWidth;
@@ -63,6 +70,15 @@ public final class MainActivity extends Activity implements AirPlayServer.Listen
         surfaceView = new SurfaceView(this);
         root.addView(surfaceView, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT, Gravity.CENTER));
+
+        playerView = new PlayerView(this);
+        playerView.setUseController(false);
+        playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT);
+        playerView.setShutterBackgroundColor(Color.BLACK);
+        playerView.setKeepContentOnPlayerReset(false);
+        playerView.setVisibility(View.GONE);
+        root.addView(playerView, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
         LinearLayout idle = new LinearLayout(this);
         idle.setOrientation(LinearLayout.VERTICAL);
@@ -88,7 +104,8 @@ public final class MainActivity extends Activity implements AirPlayServer.Listen
 
         video = new VideoDecoder(this);
         audio = new AudioPlayer();
-        server = new AirPlayServer(this, video, audio, this);
+        hls = new HlsPlayer(this, playerView, this);
+        server = new AirPlayServer(this, video, audio, hls, this);
         serverName = deviceName();
 
         surfaceView.getHolder().addCallback(new SurfaceHolder.Callback() {
@@ -143,9 +160,10 @@ public final class MainActivity extends Activity implements AirPlayServer.Listen
         final String mac = macAddress();
         final String keyFile = new File(getFilesDir(), "airplay.pem").getAbsolutePath();
         final int[] size = displaySize();
+        final String lang = Locale.getDefault().toLanguageTag();
         serverExecutor.execute(() -> {
             server.stop();
-            boolean ok = server.start(serverName, mac, keyFile, size[0], size[1], 60);
+            boolean ok = server.start(serverName, mac, keyFile, size[0], size[1], 60, lang);
             Log.i(TAG, "server start: " + ok + " name=" + serverName + " mac=" + mac);
             runOnUiThread(() -> showIdle(ok ? readyText() : getString(R.string.status_failed)));
         });
@@ -160,12 +178,33 @@ public final class MainActivity extends Activity implements AirPlayServer.Listen
 
     @Override
     public void onMirroringStarted() {
-        runOnUiThread(() -> idleView.setVisibility(View.GONE));
+        runOnUiThread(() -> {
+            playerView.setVisibility(View.GONE);
+            surfaceView.setVisibility(View.VISIBLE);
+            idleView.setVisibility(View.GONE);
+        });
     }
 
     @Override
     public void onMirroringStopped() {
-        runOnUiThread(() -> showIdle(readyText()));
+        runOnUiThread(() -> {
+            if (!hls.isActive()) showIdle(readyText());
+        });
+    }
+
+    // HlsPlayer.Listener: called on the main thread
+    @Override
+    public void onHlsStarted() {
+        idleView.setVisibility(View.GONE);
+        surfaceView.setVisibility(View.GONE);
+        playerView.setVisibility(View.VISIBLE);
+    }
+
+    @Override
+    public void onHlsStopped() {
+        playerView.setVisibility(View.GONE);
+        surfaceView.setVisibility(View.VISIBLE);
+        showIdle(readyText());
     }
 
     @Override

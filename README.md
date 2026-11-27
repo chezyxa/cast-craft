@@ -31,10 +31,11 @@ adb install -r app-release.apk
 - Повтор экрана (H.264, до 1080p, 60 к/с), поворот экрана iPhone.
 - Звук при повторе экрана (AAC‑ELD), громкость с iPhone.
 - Звук из музыкальных приложений (AAC; ALAC — если в ТВ есть декодер).
+- Видео через AirPlay (YouTube и другие приложения с кнопкой AirPlay):
+  видео играет на ТВ, телефон остаётся пультом (пауза, перемотка, стоп).
 - Без пароля и PIN: подключиться может любое устройство в сети.
 
-Пока не поддерживается: HEVC/4K, передача видео по ссылке (HLS, «AirPlay»
-из YouTube и т. п.), фоновая работа, когда приложение свёрнуто.
+Пока не поддерживается: HEVC/4K, фоновая работа, когда приложение свёрнуто.
 
 ## Как устроено
 
@@ -45,6 +46,7 @@ adb install -r app-release.apk
 | JNI | `jni_bridge.c` | запуск сервера, передача кадров и звука в Java |
 | Видео | `VideoDecoder.java` | H.264 → `MediaCodec` → `SurfaceView`, минимальная задержка |
 | Звук | `AudioPlayer.java` | AAC‑ELD/AAC/ALAC → `MediaCodec` → `AudioTrack` |
+| AirPlay-видео | `HlsPlayer.java` | HLS-плейлисты, которые lib UxPlay получает с телефона и раздаёт на `localhost` → ExoPlayer (Media3) |
 
 Зависимости собираются из исходников: [libplist](https://github.com/libimobiledevice/libplist)
 2.6.0 (в репозитории) и OpenSSL 3.0 (скачивается и собирается

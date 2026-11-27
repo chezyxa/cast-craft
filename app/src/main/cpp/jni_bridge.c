@@ -59,6 +59,13 @@ static jmethodID m_onConnectionClosed;
 static jmethodID m_onConnectionReset;
 static jmethodID m_onVideoReset;
 static jmethodID m_onClientRequest;
+static jmethodID m_onHlsPlay;
+static jmethodID m_onHlsSeek;
+static jmethodID m_onHlsRate;
+static jmethodID m_onHlsStop;
+static jmethodID m_getHlsPlaybackInfo;
+static jmethodID m_onHlsPlaylistRemove;
+static char g_lang_system[32] = "en";
 
 static raop_t *g_raop = NULL;
 static dnssd_t *g_dnssd = NULL;
@@ -343,7 +350,102 @@ static void cb_video_reset(void *cls, reset_type_t type)
 {
     (void) cls;
     ALOG(PRIO_I, "video reset, type %d", (int) type);
+    /* same library-side cleanup as UxPlay's video_reset() */
+    if (g_raop) {
+        if (type == RESET_TYPE_NOHOLD) {
+            raop_destroy_airplay_video(g_raop, -1);
+        } else if (type == RESET_TYPE_HLS_SHUTDOWN) {
+            raop_destroy_airplay_video(g_raop, -1);
+            raop_remove_hls_connections(g_raop);
+        }
+    }
     call_void_int(m_onVideoReset, (int) type);
+}
+
+/* ------------------------------------------- AirPlay video (HLS) callbacks */
+
+static void cb_on_video_play(void *cls, const char *location, const float start_position)
+{
+    (void) cls;
+    ALOG(PRIO_I, "video play %s from %f s", location, start_position);
+    JNIEnv *env = get_env();
+    if (env && g_server) {
+        jstring jurl = (*env)->NewStringUTF(env, location);
+        (*env)->CallVoidMethod(env, g_server, m_onHlsPlay, jurl, (jfloat) start_position);
+        check_exception(env);
+        (*env)->DeleteLocalRef(env, jurl);
+    }
+    cb_video_reset(cls, RESET_TYPE_ON_VIDEO_PLAY);
+}
+
+static void cb_on_video_scrub(void *cls, const float position)
+{
+    (void) cls;
+    JNIEnv *env = get_env();
+    if (!env || !g_server) return;
+    (*env)->CallVoidMethod(env, g_server, m_onHlsSeek, (jfloat) position);
+    check_exception(env);
+}
+
+static void cb_on_video_rate(void *cls, const float rate)
+{
+    (void) cls;
+    JNIEnv *env = get_env();
+    if (!env || !g_server) return;
+    (*env)->CallVoidMethod(env, g_server, m_onHlsRate, (jfloat) rate);
+    check_exception(env);
+}
+
+static void cb_on_video_stop(void *cls)
+{
+    (void) cls;
+    call_void(m_onHlsStop);
+}
+
+static void cb_on_video_acquire_playback_info(void *cls, playback_info_t *info)
+{
+    (void) cls;
+    info->duration = 0.0;
+    info->position = -1.0;
+    info->seek_start = 0.0;
+    info->seek_duration = 0.0;
+    info->rate = 0.0f;
+    info->playback_buffer_empty = false;
+    info->playback_buffer_full = true;
+    info->ready_to_play = true;
+    info->playback_likely_to_keep_up = true;
+    JNIEnv *env = get_env();
+    if (!env || !g_server) return;
+    jdoubleArray arr = (jdoubleArray) (*env)->CallObjectMethod(env, g_server, m_getHlsPlaybackInfo);
+    check_exception(env);
+    if (!arr) return;
+    jdouble v[6] = {0};
+    if ((*env)->GetArrayLength(env, arr) >= 6) {
+        (*env)->GetDoubleArrayRegion(env, arr, 0, 6, v);
+        info->duration = v[0];
+        info->position = v[1];
+        info->seek_start = v[2];
+        info->seek_duration = v[3];
+        info->rate = (float) v[4];
+        if (v[5] != 0.0) {
+            /* finished: tells the library to end the session (as UxPlay does) */
+            ALOG(PRIO_I, "video has finished at %f", v[1]);
+            info->position = -1.0;
+            info->duration = -1.0;
+            call_void(m_onHlsStop);
+        }
+    }
+    (*env)->DeleteLocalRef(env, arr);
+}
+
+static float cb_on_video_playlist_remove(void *cls)
+{
+    (void) cls;
+    JNIEnv *env = get_env();
+    if (!env || !g_server) return 0.0f;
+    jfloat pos = (*env)->CallFloatMethod(env, g_server, m_onHlsPlaylistRemove);
+    check_exception(env);
+    return (float) pos;
 }
 
 static int cb_video_set_codec_and_size(void *cls, video_codec_t codec, unsigned short width_source,
@@ -431,14 +533,15 @@ static void stop_locked(void)
 static void set_features(dnssd_t *dnssd)
 {
     /* same defaults as UxPlay (uxplay.cpp start_dnssd), H.264 mirroring only */
-    static const int on[] = {1, 2, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 25, 28, 30};
-    static const int off[] = {0, 3, 4, 8, 23, 24, 26, 27, 29, 31, 42};
+    /* bits 0 and 4: AirPlay video + HLS (UxPlay -hls), bit 42 off: no H.265 */
+    static const int on[] = {0, 1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 25, 28, 30};
+    static const int off[] = {3, 8, 23, 24, 26, 27, 29, 31, 42};
     for (size_t i = 0; i < sizeof(on) / sizeof(on[0]); i++) dnssd_set_airplay_features(dnssd, on[i], 1);
     for (size_t i = 0; i < sizeof(off) / sizeof(off[0]); i++) dnssd_set_airplay_features(dnssd, off[i], 0);
 }
 
 static jboolean start_server(JNIEnv *env, jobject thiz, jstring jname, jstring jmac, jstring jkeyfile,
-                             jint width, jint height, jint fps)
+                             jint width, jint height, jint fps, jstring jlang)
 {
     pthread_mutex_lock(&g_lock);
     stop_locked();
@@ -452,6 +555,11 @@ static jboolean start_server(JNIEnv *env, jobject thiz, jstring jname, jstring j
     const char *mac = (*env)->GetStringUTFChars(env, jmac, NULL);
     const char *keyfile = (*env)->GetStringUTFChars(env, jkeyfile, NULL);
     jboolean result = JNI_FALSE;
+    if (jlang) {
+        const char *lang = (*env)->GetStringUTFChars(env, jlang, NULL);
+        if (lang && *lang) snprintf(g_lang_system, sizeof(g_lang_system), "%s", lang);
+        (*env)->ReleaseStringUTFChars(env, jlang, lang);
+    }
 
     char hw_addr[6];
     int error = 0;
@@ -496,6 +604,12 @@ static jboolean start_server(JNIEnv *env, jobject thiz, jstring jname, jstring j
     cbs.video_reset = cb_video_reset;
     cbs.video_set_codec_and_size = cb_video_set_codec_and_size;
     cbs.get_custom_profile = cb_get_custom_profile;
+    cbs.on_video_play = cb_on_video_play;
+    cbs.on_video_scrub = cb_on_video_scrub;
+    cbs.on_video_rate = cb_on_video_rate;
+    cbs.on_video_stop = cb_on_video_stop;
+    cbs.on_video_acquire_playback_info = cb_on_video_acquire_playback_info;
+    cbs.on_video_playlist_remove = cb_on_video_playlist_remove;
 
     g_raop = raop_init(&cbs);
     if (!g_raop) {
@@ -517,6 +631,7 @@ static jboolean start_server(JNIEnv *env, jobject thiz, jstring jname, jstring j
         raop_set_plist(g_raop, "refreshRate", fps);
         raop_set_plist(g_raop, "maxFPS", fps);
     }
+    raop_set_plist(g_raop, "hls", 1);
 
     unsigned short tcp[3] = {0, 0, 0};
     unsigned short udp[3] = {0, 0, 0};
@@ -530,6 +645,7 @@ static jboolean start_server(JNIEnv *env, jobject thiz, jstring jname, jstring j
     }
     raop_set_port(g_raop, port);
     raop_set_dnssd(g_raop, g_dnssd);
+    raop_set_lang(g_raop, "", "", g_lang_system); /* stores the pointer: g_lang_system is static */
     ALOG(PRIO_I, "AirPlay server listening on port %u", port);
 
     if (dnssd_register_raop(g_dnssd, port) || dnssd_register_airplay(g_dnssd, port)) {
@@ -572,7 +688,8 @@ static void reset_connections(JNIEnv *env, jobject thiz)
 }
 
 static const JNINativeMethod methods[] = {
-    {"nativeStart", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;III)Z", (void *) start_server},
+    {"nativeStart", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;IIILjava/lang/String;)Z",
+     (void *) start_server},
     {"nativeStop", "()V", (void *) stop_server},
     {"nativeResetConnections", "()V", (void *) reset_connections},
 };
@@ -607,6 +724,12 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved)
     GET(m_onConnectionReset, "onConnectionReset", "(I)V");
     GET(m_onVideoReset, "onVideoReset", "(I)V");
     GET(m_onClientRequest, "onClientRequest", "(Ljava/lang/String;Ljava/lang/String;)V");
+    GET(m_onHlsPlay, "onHlsPlay", "(Ljava/lang/String;F)V");
+    GET(m_onHlsSeek, "onHlsSeek", "(F)V");
+    GET(m_onHlsRate, "onHlsRate", "(F)V");
+    GET(m_onHlsStop, "onHlsStop", "()V");
+    GET(m_getHlsPlaybackInfo, "getHlsPlaybackInfo", "()[D");
+    GET(m_onHlsPlaylistRemove, "onHlsPlaylistRemove", "()F");
 #undef GET
     (*env)->DeleteLocalRef(env, cls);
     return JNI_VERSION_1_6;

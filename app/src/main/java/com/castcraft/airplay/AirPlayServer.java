@@ -36,18 +36,20 @@ public final class AirPlayServer {
     private final Map<String, NsdManager.RegistrationListener> registrations = new HashMap<>();
     private final VideoDecoder video;
     private final AudioPlayer audio;
+    private final HlsPlayer hls;
     private final Listener listener;
     private volatile boolean mirroring;
 
-    public AirPlayServer(Context context, VideoDecoder video, AudioPlayer audio, Listener listener) {
+    public AirPlayServer(Context context, VideoDecoder video, AudioPlayer audio, HlsPlayer hls, Listener listener) {
         this.nsdManager = (NsdManager) context.getSystemService(Context.NSD_SERVICE);
         this.video = video;
         this.audio = audio;
+        this.hls = hls;
         this.listener = listener;
     }
 
-    public boolean start(String name, String mac, String keyFile, int width, int height, int fps) {
-        return nativeStart(name, mac, keyFile, width, height, fps);
+    public boolean start(String name, String mac, String keyFile, int width, int height, int fps, String lang) {
+        return nativeStart(name, mac, keyFile, width, height, fps, lang);
     }
 
     public void stop() {
@@ -62,6 +64,7 @@ public final class AirPlayServer {
             registrations.clear();
         }
         endMirroring();
+        hls.stop();
     }
 
     private void endMirroring() {
@@ -75,7 +78,8 @@ public final class AirPlayServer {
 
     // ------------------------------------------------------------------ natives
 
-    private native boolean nativeStart(String name, String mac, String keyFile, int width, int height, int fps);
+    private native boolean nativeStart(String name, String mac, String keyFile, int width, int height, int fps,
+                                       String lang);
 
     private native void nativeStop();
 
@@ -201,6 +205,7 @@ public final class AirPlayServer {
     private void onConnectionClosed(int remaining) {
         if (remaining <= 0) {
             endMirroring();
+            hls.stop();
         }
     }
 
@@ -208,11 +213,67 @@ public final class AirPlayServer {
     private void onConnectionReset(int reason) {
         // Client vanished (e.g. lost Wi-Fi). UxPlay restarts its server in this case.
         endMirroring();
+        hls.stop();
         listener.onServerRestartRequested();
     }
 
+    // reset types, see raop.h reset_type_t
+    private static final int RESET_NOHOLD = 0;
+    private static final int RESET_RTP_SHUTDOWN = 1;
+    private static final int RESET_HLS_SHUTDOWN = 2;
+    private static final int RESET_HLS_EOS = 3;
+    private static final int RESET_ON_VIDEO_PLAY = 4;
+    private static final int RESET_RTP_TO_HLS_TEARDOWN = 5;
+
     @SuppressWarnings("unused")
     private void onVideoReset(int type) {
+        switch (type) {
+            case RESET_ON_VIDEO_PLAY:
+                break;
+            case RESET_RTP_SHUTDOWN:
+            case RESET_RTP_TO_HLS_TEARDOWN:
+                endMirroring();
+                break;
+            case RESET_NOHOLD:
+            case RESET_HLS_SHUTDOWN:
+            case RESET_HLS_EOS:
+            default:
+                endMirroring();
+                hls.stop();
+                break;
+        }
+    }
+
+    // ------------------------------------------------- AirPlay video (HLS / URL)
+
+    @SuppressWarnings("unused")
+    private void onHlsPlay(String url, float startSeconds) {
         endMirroring();
+        hls.play(url, startSeconds);
+    }
+
+    @SuppressWarnings("unused")
+    private void onHlsSeek(float seconds) {
+        hls.seek(seconds);
+    }
+
+    @SuppressWarnings("unused")
+    private void onHlsRate(float rate) {
+        hls.setRate(rate);
+    }
+
+    @SuppressWarnings("unused")
+    private void onHlsStop() {
+        hls.stop();
+    }
+
+    @SuppressWarnings("unused")
+    private double[] getHlsPlaybackInfo() {
+        return hls.playbackInfo();
+    }
+
+    @SuppressWarnings("unused")
+    private float onHlsPlaylistRemove() {
+        return hls.pauseForPlaylistRemove();
     }
 }

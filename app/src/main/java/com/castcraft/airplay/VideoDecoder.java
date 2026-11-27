@@ -10,19 +10,32 @@ import android.util.Log;
 import android.view.Surface;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
+import java.util.List;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 /**
  * Decodes the H.264 mirroring stream (Annex-B, SPS/PPS prepended to key frames
- * by the native code) with MediaCodec straight onto a Surface. Frames are shown
- * as soon as they are decoded, for the lowest latency.
+ * by the native code) with MediaCodec straight onto a Surface.
+ *
+ * iOS sends key frames very rarely (often only once per session), so a lost
+ * frame would freeze the picture until the next one. To avoid that:
+ *  - frames are never dropped before decoding; a feeder thread waits for
+ *    input buffers while a separate drain thread keeps output flowing;
+ *  - every frame since the last key frame is kept, so the decoder can be
+ *    rebuilt (new surface, decoder error) without waiting for a key frame;
+ *  - when decoding falls behind, frames are decoded but not shown until the
+ *    decoder has caught up, which keeps latency low without breaking references.
  */
 public final class VideoDecoder {
     private static final String TAG = "CastCraftVideo";
     private static final String MIME = MediaFormat.MIMETYPE_VIDEO_AVC;
+    private static final int MAX_GOP_FRAMES = 1800;
+    private static final long MAX_GOP_BYTES = 48L * 1024 * 1024;
+    /** Output frames older than this (in frames behind the newest received) are not shown. */
+    private static final long MAX_DISPLAY_LAG = 8;
 
     public interface SizeListener {
         void onVideoSizeChanged(int width, int height);
@@ -30,13 +43,13 @@ public final class VideoDecoder {
 
     private static final class Frame {
         final byte[] data;
-        final long ptsUs;
+        final long seq;
         final byte[] sps;
         final byte[] pps;
 
-        Frame(byte[] data, long ptsUs, byte[] sps, byte[] pps) {
+        Frame(byte[] data, long seq, byte[] sps, byte[] pps) {
             this.data = data;
-            this.ptsUs = ptsUs;
+            this.seq = seq;
             this.sps = sps;
             this.pps = pps;
         }
@@ -46,23 +59,24 @@ public final class VideoDecoder {
         }
     }
 
-    private static final Frame FLUSH = new Frame(new byte[0], 0, null, null);
-
     private final SizeListener sizeListener;
-    private final BlockingQueue<Frame> queue = new ArrayBlockingQueue<>(90);
+    private final LinkedBlockingQueue<Frame> queue = new LinkedBlockingQueue<>();
     private final Object lock = new Object();
 
+    // guarded by lock
+    private final List<Frame> gop = new ArrayList<>();
+    private long gopBytes;
+    private boolean gopComplete;
+    private long nextSeq;
     private Surface surface;
-    private boolean surfaceChanged;
-    private Frame lastKeyFrame;
-    private Thread thread;
-    private volatile boolean running;
+    private boolean rebuildRequested;
+    private Thread feeder;
+    private boolean running;
 
-    // owned by the decoder thread
-    private MediaCodec codec;
-    private byte[] codecSps;
-    private byte[] codecPps;
-    private final MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+    private volatile long newestSeq;
+
+    // feeder thread state
+    private Session session;
 
     public VideoDecoder(SizeListener sizeListener) {
         this.sizeListener = sizeListener;
@@ -71,201 +85,233 @@ public final class VideoDecoder {
     public void setSurface(Surface surface) {
         synchronized (lock) {
             this.surface = surface;
-            this.surfaceChanged = true;
+            this.rebuildRequested = true;
         }
     }
 
-    /** Called from the native network thread. */
+    /** Called from the native network thread. Never blocks for long. */
     public void submit(byte[] annexB, long ptsUs) {
         byte[][] params = findSpsPps(annexB);
-        Frame frame = new Frame(annexB, ptsUs, params[0], params[1]);
         synchronized (lock) {
+            Frame frame = new Frame(annexB, nextSeq++, params[0], params[1]);
+            newestSeq = frame.seq;
             if (frame.isConfig()) {
-                lastKeyFrame = frame;
+                gop.clear();
+                gopBytes = 0;
+                gopComplete = true;
             }
-            if (!running) {
-                running = true;
-                thread = new Thread(this::loop, "CastCraftVideoDecoder");
-                thread.start();
-            }
-        }
-        if (!queue.offer(frame)) {
-            // Decoder is too slow: drop the backlog and wait for the decoder to catch up.
-            Log.w(TAG, "video queue full, dropping frames");
-            queue.clear();
-            Frame key = lastKeyFrame;
-            if (key != null && key != frame) {
-                queue.offer(key);
+            if (gopComplete) {
+                if (gop.size() < MAX_GOP_FRAMES && gopBytes + annexB.length < MAX_GOP_BYTES) {
+                    gop.add(frame);
+                    gopBytes += annexB.length;
+                } else {
+                    gopComplete = false; // too long to replay; a rebuild will wait for the next key frame
+                    gop.clear();
+                    gopBytes = 0;
+                }
             }
             queue.offer(frame);
+            if (!running) {
+                running = true;
+                feeder = new Thread(this::feedLoop, "CastCraftVideoFeed");
+                feeder.start();
+            }
         }
     }
 
     public void flush() {
-        queue.clear();
-        queue.offer(FLUSH);
+        // The stream continues with the same references after a flush; nothing to drop.
     }
 
-    /** Stops decoding (end of mirroring session). Safe to call at any time. */
+    /** Stops decoding (end of mirroring session). Safe to call from any thread. */
     public void stop() {
         Thread t;
         synchronized (lock) {
             running = false;
-            t = thread;
-            thread = null;
-            lastKeyFrame = null;
+            t = feeder;
+            feeder = null;
+            gop.clear();
+            gopBytes = 0;
+            gopComplete = false;
+            queue.clear();
         }
         if (t != null) {
             t.interrupt();
             if (t != Thread.currentThread()) {
                 try {
-                    t.join(2000);
+                    t.join(3000);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
             }
         }
-        queue.clear();
     }
 
-    // ------------------------------------------------------------- decoder thread
+    // ------------------------------------------------------------- feeder thread
 
-    private void loop() {
+    private boolean isRunning() {
+        synchronized (lock) {
+            return running && feeder == Thread.currentThread();
+        }
+    }
+
+    private void feedLoop() {
         try {
-            while (running) {
-                Frame frame = queue.poll(10, TimeUnit.MILLISECONDS);
-                handleSurfaceChange();
-                if (frame == FLUSH) {
-                    if (codec != null) {
-                        try {
-                            codec.flush();
-                        } catch (IllegalStateException e) {
-                            releaseCodec();
-                        }
-                    }
-                } else if (frame != null) {
-                    decode(frame);
+            while (isRunning()) {
+                boolean rebuild;
+                synchronized (lock) {
+                    rebuild = rebuildRequested;
+                    rebuildRequested = false;
                 }
-                drain();
+                if (rebuild || (session != null && session.failed)) {
+                    rebuild();
+                    continue;
+                }
+                Frame frame = queue.poll(20, TimeUnit.MILLISECONDS);
+                if (frame == null) continue;
+                if (frame.isConfig() && (session == null
+                        || !Arrays.equals(frame.sps, session.sps) || !Arrays.equals(frame.pps, session.pps))) {
+                    // first frame, rotation / resolution change or new encoder settings
+                    rebuild();
+                    continue;
+                }
+                if (session != null) {
+                    session.feed(frame);
+                }
             }
         } catch (InterruptedException ignored) {
         } finally {
-            releaseCodec();
+            closeSession();
         }
     }
 
-    private void handleSurfaceChange() {
+    /** Recreates the decoder and replays everything since the last key frame. */
+    private void rebuild() throws InterruptedException {
+        closeSession();
+        List<Frame> replay;
         Surface s;
-        Frame key;
         synchronized (lock) {
-            if (!surfaceChanged) return;
-            surfaceChanged = false;
             s = surface;
-            key = lastKeyFrame;
+            replay = gopComplete ? new ArrayList<>(gop) : new ArrayList<>();
+            // everything still queued is part of the replay; later frames go to the queue as usual
+            queue.clear();
         }
-        releaseCodec();
-        if (s != null && key != null) {
-            // restart from the most recent key frame so the picture comes back at once
-            decode(key);
+        if (s == null || !s.isValid() || replay.isEmpty() || !replay.get(0).isConfig()) {
+            return; // wait for a surface / the next key frame
         }
-    }
-
-    private void decode(Frame frame) {
-        if (frame.isConfig() && (codec == null
-                || !Arrays.equals(frame.sps, codecSps) || !Arrays.equals(frame.pps, codecPps))) {
-            // first frame, new resolution (rotation) or new encoder settings
-            releaseCodec();
-            createCodec(frame.sps, frame.pps);
-        }
-        if (codec == null) return;
-        try {
-            int index = codec.dequeueInputBuffer(50_000);
-            if (index < 0) {
-                Log.w(TAG, "no input buffer, frame dropped");
-                return;
-            }
-            ByteBuffer buf = codec.getInputBuffer(index);
-            if (buf == null) return;
-            buf.clear();
-            if (frame.data.length > buf.capacity()) {
-                Log.w(TAG, "frame too large: " + frame.data.length);
-                codec.queueInputBuffer(index, 0, 0, frame.ptsUs, 0);
-                return;
-            }
-            buf.put(frame.data);
-            codec.queueInputBuffer(index, 0, frame.data.length, frame.ptsUs,
-                    frame.isConfig() ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0);
-        } catch (IllegalStateException e) {
-            Log.e(TAG, "decoder error", e);
-            releaseCodec();
+        Frame key = replay.get(0);
+        session = createSession(key.sps, key.pps, s);
+        if (session == null) return;
+        Log.i(TAG, "decoder rebuilt, replaying " + replay.size() + " frames");
+        for (Frame f : replay) {
+            if (!isRunning()) return;
+            session.feed(f);
         }
     }
 
-    private void drain() {
-        if (codec == null) return;
-        try {
-            while (true) {
-                int index = codec.dequeueOutputBuffer(info, 0);
-                if (index >= 0) {
-                    codec.releaseOutputBuffer(index, true);
-                } else if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    reportSize(codec.getOutputFormat());
-                } else {
-                    break;
+    private void closeSession() {
+        if (session != null) {
+            session.close();
+            session = null;
+        }
+    }
+
+    /** One configured MediaCodec instance with its own output thread. */
+    private static final class Session {
+        final MediaCodec codec;
+        final byte[] sps;
+        final byte[] pps;
+        final SizeListener sizeListener;
+        final VideoDecoder owner;
+        volatile boolean active = true;
+        volatile boolean failed;
+        Thread drainer;
+
+        private Session(MediaCodec codec, byte[] sps, byte[] pps, SizeListener l, VideoDecoder owner) {
+            this.codec = codec;
+            this.sps = sps;
+            this.pps = pps;
+            this.sizeListener = l;
+            this.owner = owner;
+        }
+
+        void feed(Frame frame) throws InterruptedException {
+            while (active && !failed) {
+                int index;
+                try {
+                    index = codec.dequeueInputBuffer(100_000);
+                } catch (IllegalStateException e) {
+                    fail(e);
+                    return;
+                }
+                if (index < 0) {
+                    if (Thread.interrupted()) throw new InterruptedException();
+                    continue; // keep waiting: dropping a frame would corrupt the picture
+                }
+                try {
+                    ByteBuffer buf = codec.getInputBuffer(index);
+                    if (buf == null || frame.data.length > buf.capacity()) {
+                        Log.w(TAG, "frame of " + frame.data.length + " bytes does not fit, decoder rebuilt");
+                        codec.queueInputBuffer(index, 0, 0, frame.seq, 0);
+                        fail(null);
+                        return;
+                    }
+                    buf.clear();
+                    buf.put(frame.data);
+                    codec.queueInputBuffer(index, 0, frame.data.length, frame.seq,
+                            frame.isConfig() ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0);
+                } catch (IllegalStateException e) {
+                    fail(e);
+                }
+                return;
+            }
+        }
+
+        void drainLoop() {
+            MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+            while (active && !failed) {
+                try {
+                    int index = codec.dequeueOutputBuffer(info, 20_000);
+                    if (index >= 0) {
+                        boolean show = owner.newestSeq - info.presentationTimeUs <= MAX_DISPLAY_LAG;
+                        codec.releaseOutputBuffer(index, show);
+                    } else if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        reportSize(codec.getOutputFormat());
+                    }
+                } catch (IllegalStateException e) {
+                    if (active) fail(e);
                 }
             }
-        } catch (IllegalStateException e) {
-            Log.e(TAG, "decoder error", e);
-            releaseCodec();
         }
-    }
 
-    private void reportSize(MediaFormat f) {
-        int w = f.getInteger(MediaFormat.KEY_WIDTH);
-        int h = f.getInteger(MediaFormat.KEY_HEIGHT);
-        if (f.containsKey("crop-left") && f.containsKey("crop-right")) {
-            w = f.getInteger("crop-right") - f.getInteger("crop-left") + 1;
+        void fail(Exception e) {
+            if (e != null) Log.e(TAG, "decoder error, rebuilding", e);
+            failed = true;
         }
-        if (f.containsKey("crop-top") && f.containsKey("crop-bottom")) {
-            h = f.getInteger("crop-bottom") - f.getInteger("crop-top") + 1;
-        }
-        Log.i(TAG, "decoded size " + w + "x" + h);
-        sizeListener.onVideoSizeChanged(w, h);
-    }
 
-    private void createCodec(byte[] sps, byte[] pps) {
-        Surface s;
-        synchronized (lock) {
-            s = surface;
+        void reportSize(MediaFormat f) {
+            int w = f.getInteger(MediaFormat.KEY_WIDTH);
+            int h = f.getInteger(MediaFormat.KEY_HEIGHT);
+            if (f.containsKey("crop-left") && f.containsKey("crop-right")) {
+                w = f.getInteger("crop-right") - f.getInteger("crop-left") + 1;
+            }
+            if (f.containsKey("crop-top") && f.containsKey("crop-bottom")) {
+                h = f.getInteger("crop-bottom") - f.getInteger("crop-top") + 1;
+            }
+            Log.i(TAG, "decoded size " + w + "x" + h);
+            sizeListener.onVideoSizeChanged(w, h);
         }
-        if (s == null || !s.isValid()) return;
-        int[] size = SpsParser.size(sps);
-        int width = size != null ? size[0] : 1920;
-        int height = size != null ? size[1] : 1080;
-        MediaFormat format = MediaFormat.createVideoFormat(MIME, width, height);
-        format.setByteBuffer("csd-0", ByteBuffer.wrap(sps));
-        format.setByteBuffer("csd-1", ByteBuffer.wrap(pps));
-        format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, Math.max(width * height, 1024 * 1024));
-        format.setInteger(MediaFormat.KEY_PRIORITY, 0); // realtime
-        if (android.os.Build.VERSION.SDK_INT >= 30) {
-            format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1);
-        }
-        try {
-            codec = MediaCodec.createDecoderByType(MIME);
-            codec.configure(format, s, null, 0);
-            codec.start();
-            codecSps = sps;
-            codecPps = pps;
-            Log.i(TAG, "decoder " + codec.getName() + " started for " + width + "x" + height);
-            sizeListener.onVideoSizeChanged(width, height);
-        } catch (Exception e) {
-            Log.e(TAG, "cannot start decoder", e);
-            releaseCodec();
-        }
-    }
 
-    private void releaseCodec() {
-        if (codec != null) {
+        void close() {
+            active = false;
+            if (drainer != null) {
+                drainer.interrupt();
+                try {
+                    drainer.join(1000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
             try {
                 codec.stop();
             } catch (Exception ignored) {
@@ -274,10 +320,37 @@ public final class VideoDecoder {
                 codec.release();
             } catch (Exception ignored) {
             }
-            codec = null;
         }
-        codecSps = null;
-        codecPps = null;
+    }
+
+    private Session createSession(byte[] sps, byte[] pps, Surface s) {
+        int[] size = SpsParser.size(sps);
+        int width = size != null ? size[0] : 1920;
+        int height = size != null ? size[1] : 1080;
+        MediaFormat format = MediaFormat.createVideoFormat(MIME, width, height);
+        format.setByteBuffer("csd-0", ByteBuffer.wrap(sps));
+        format.setByteBuffer("csd-1", ByteBuffer.wrap(pps));
+        format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, Math.max(width * height * 2, 2 * 1024 * 1024));
+        format.setInteger(MediaFormat.KEY_PRIORITY, 0); // realtime
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1);
+        }
+        MediaCodec codec = null;
+        try {
+            codec = MediaCodec.createDecoderByType(MIME);
+            codec.configure(format, s, null, 0);
+            codec.start();
+        } catch (Exception e) {
+            Log.e(TAG, "cannot start decoder", e);
+            if (codec != null) codec.release();
+            return null;
+        }
+        Log.i(TAG, "decoder " + codec.getName() + " started for " + width + "x" + height);
+        sizeListener.onVideoSizeChanged(width, height);
+        Session session = new Session(codec, sps, pps, sizeListener, this);
+        session.drainer = new Thread(session::drainLoop, "CastCraftVideoDrain");
+        session.drainer.start();
+        return session;
     }
 
     // ------------------------------------------------------------------ parsing
